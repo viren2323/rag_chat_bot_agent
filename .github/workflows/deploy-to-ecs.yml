@@ -1,0 +1,87 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_run:
+    workflows: ["Build and Push to ECR"]
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  ECS_CLUSTER: modicare-rag-cluster
+  ECS_SERVICE: modicare-rag-service
+  ECS_TASK_DEFINITION: modicare-rag-task
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event.workflow_run.conclusion == 'success')
+    
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Get latest image from ECR
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/modicare-rag:latest"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Using image: $IMAGE_URI"
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: modicare-rag
+          image: ${{ steps.image.outputs.IMAGE_URI }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].deployments' \
+            --output table
+
+      - name: Deployment notification
+        run: |
+          echo "✅ Deployment completed successfully!"
+          echo "Service: ${{ env.ECS_SERVICE }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "Image: ${{ steps.image.outputs.IMAGE_URI }}"
